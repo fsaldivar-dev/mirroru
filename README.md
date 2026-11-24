@@ -1,0 +1,58 @@
+<p align="center"><img src="assets/banner.png" alt="Mirroru — Mirror Android & iOS on your Mac. No accounts." width="100%"></p>
+
+# <img src="assets/icon_1024.png" width="36" align="top" alt=""> Mirroru
+
+Espejo de Android e iOS por USB para macOS, lanzado desde un CLI. Sin cuentas, sin iCloud y sin instalar nada en el teléfono. La ventana imita al Simulador de Xcode: nombre del dispositivo arriba y botones de captura, video y GIF.
+
+| | Ver | Captura / video / GIF | Control |
+|---|---|---|---|
+| **Android** | sí | sí | toque, deslizar, teclado, Inicio/Atrás/Recientes |
+| **iOS** | sí | sí | no (iOS no permite inyectar toques) |
+
+## Instalar
+
+```bash
+scripts/build.sh --install
+```
+
+Crea `build/Mirroru.app` (con su icono) y enlaza el comando `mirroru` en `/usr/local/bin` o `~/.local/bin`.
+Requiere macOS 14+, Xcode (Swift) y, para Android, `adb`.
+
+## Uso
+
+```bash
+mirroru                     # abre una ventana por cada dispositivo conectado
+mirroru devices             # lista dispositivos
+mirroru open -d ios         # solo el iPhone  (-d acepta serial, nombre o android/ios)
+mirroru screenshot -o a.png # captura sin abrir ventana
+mirroru record -t 10        # video de 10 s (o Ctrl-C para terminar)
+mirroru gif -t 5            # GIF de 5 s
+mirroru open --demo         # fuente sintética, para probar sin teléfono
+```
+
+En la ventana: **⌘S** captura, **⌘R** video, **⌘G** GIF. Los archivos van al Escritorio.
+En Android: clic = toque, clic largo = pulsación larga, arrastrar = deslizar, rueda = scroll,
+clic derecho o Esc = Atrás, ⇧⌘H Inicio, ⇧⌘A recientes, ⌘L bloquear, teclado = texto.
+
+## Preparar el teléfono
+
+- **iPhone / iPad**: conéctalo por cable, desbloquéalo y pulsa «Confiar». La primera vez macOS pedirá
+  permiso de **Cámara** para Mirroru: así expone Apple la pantalla por USB (el mismo mecanismo que
+  QuickTime). No se usa ninguna cámara. Mientras se captura, iOS muestra 9:41 en la barra de estado.
+- **Android**: activa *Opciones de desarrollador › Depuración USB* y acepta la huella del Mac.
+
+Los comandos sin ventana (`screenshot`, `record`, `gif`) con iOS usan el permiso de Cámara de tu terminal.
+
+## Cómo funciona
+
+- `IOSSource`: activa los dispositivos de captura de pantalla de CoreMediaIO y lee cuadros con AVFoundation.
+- `AndroidSource`: `adb exec-out screenrecord` (H.264) decodificado con VideoToolbox; la entrada va por
+  `adb shell input`. Las capturas de Android usan `screencap` (PNG sin pérdida).
+- `FrameHub` reparte cada cuadro a la ventana, al grabador de video (AVAssetWriter, .mp4) y al de GIF (ImageIO).
+
+## Límites conocidos
+
+- Sin audio.
+- El control de Android usa `input`, que tarda unas décimas por gesto; no hay arrastre continuo ni multitáctil.
+- `screenrecord` se reinicia cada 3 min (un parpadeo imperceptible) y solo envía cuadros cuando la pantalla cambia.
+- Los GIF se limitan a 600 cuadros (~50 s) a 12 fps y 360 px de ancho.
