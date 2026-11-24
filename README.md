@@ -56,3 +56,7 @@ Los comandos sin ventana (`screenshot`, `record`, `gif`) con iOS usan el permiso
 - El control de Android usa `input`, que tarda unas décimas por gesto; no hay arrastre continuo ni multitáctil.
 - `screenrecord` se reinicia cada 3 min (un parpadeo imperceptible) y solo envía cuadros cuando la pantalla cambia.
 - Los GIF se limitan a 600 cuadros (~50 s) a 12 fps y 360 px de ancho.
+
+## Licencia
+
+[MIT](LICENSE)
