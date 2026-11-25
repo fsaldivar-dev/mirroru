@@ -37,9 +37,22 @@ final class FrameHub {
     var onFrame: ((CVPixelBuffer) -> Void)?
 
     private let queue = DispatchQueue(label: "mirroru.hub")
+    /// What is shown and captured: the device frame, or its blur while hidden.
     private var latest: CVPixelBuffer?
+    private var raw: CVPixelBuffer?
+    private var hidden = false
+    private let blurrer = Blurrer()
+    /// Small copies of the last few seconds of device frames (see `Fingerprint`).
+    private var recent: [(time: CFTimeInterval, print: Fingerprint)] = []
     private var recorder: Recorder?
     private var gif: GifRecorder?
+    /// Seconds each frame waits before it is shown or captured (0 = no wait). See `setHoldback`.
+    private var holdback: CFTimeInterval = 0
+    /// Frames taken before this moment are never shown clear.
+    private var clearSince: CFTimeInterval = 0
+    /// Bumped to throw away the frames that are still waiting.
+    private var generation = 0
+    private var lastHeld: CFTimeInterval = 0
 
     var hasFrame: Bool { queue.sync { latest != nil } }
     var isRecording: Bool { queue.sync { recorder != nil } }
@@ -47,11 +60,90 @@ final class FrameHub {
 
     func push(_ buffer: CVPixelBuffer) {
         queue.async {
-            self.latest = buffer
-            self.recorder?.append(buffer)
-            if self.gif?.append(buffer) == false { self.gifLimitReached?() }
-            DispatchQueue.main.async { self.onFrame?(buffer) }
+            self.raw = buffer
+            let now = CACurrentMediaTime()
+            if now - (self.recent.last?.time ?? 0) >= 0.2, let print = Fingerprint(buffer) {
+                self.recent.append((now, print))
+                self.recent.removeAll { now - $0.time > 5 }
+            }
+            self.submit(buffer, at: now)
         }
+    }
+
+    /// The news that the user left the app arrives a few tenths of a second late. With a holdback, frames
+    /// wait that long before reaching the screen and the captures, so the ones taken in the meantime are
+    /// still in hand when the news comes and go out blurred: the other app is never seen, live or recorded.
+    func setHoldback(_ seconds: CFTimeInterval) {
+        queue.sync { holdback = seconds }
+    }
+
+    private func submit(_ buffer: CVPixelBuffer, at time: CFTimeInterval) {
+        guard holdback > 0 else { return process(buffer, takenAt: time) }
+        // Waiting frames stay in memory, so half the frame rate is enough while they are held.
+        guard time - lastHeld >= 1.0 / 31 else { return }
+        lastHeld = time
+        let generation = generation
+        queue.asyncAfter(deadline: .now() + holdback) {
+            guard generation == self.generation else { return }
+            self.process(buffer, takenAt: time)
+        }
+    }
+
+    /// How the device screen looked `seconds` ago (the real picture, also while private).
+    func fingerprint(secondsAgo seconds: CFTimeInterval) -> Fingerprint? {
+        queue.sync {
+            let moment = CACurrentMediaTime() - seconds
+            return (recent.last { $0.time <= moment } ?? recent.first)?.print
+        }
+    }
+
+    /// The latest look of the device screen taken between two moments (`CACurrentMediaTime`), if any.
+    func fingerprint(between start: CFTimeInterval, and end: CFTimeInterval) -> Fingerprint? {
+        queue.sync { recent.last { $0.time >= start && $0.time <= end }?.print }
+    }
+
+    /// How the device screen looks now.
+    func currentFingerprint() -> Fingerprint? {
+        queue.sync { raw.flatMap(Fingerprint.init) }
+    }
+
+    /// Private mode: while hidden, every consumer (screen, screenshot, video, GIF) gets a blur.
+    /// `settle`: when showing again with a holdback, how much longer the picture stays private, for devices
+    /// that report the new app before its opening animation (still showing the previous screen) is over.
+    func setHidden(_ hidden: Bool, settle: CFTimeInterval = 0) {
+        queue.sync {
+            guard hidden != self.hidden else { return }
+            self.hidden = hidden
+            let now = CACurrentMediaTime()
+            // Whatever was waiting belongs to the previous state: drop it.
+            generation += 1
+            if hidden {
+                if let raw { process(raw, takenAt: now) }
+            } else if holdback > 0 {
+                // Frames from before this moment may still show the app the user is coming back from.
+                clearSince = now + settle
+                // A still screen sends no more frames, so the current one is sent again once it may be shown.
+                let generation = generation
+                queue.asyncAfter(deadline: .now() + settle + 0.02) {
+                    guard generation == self.generation, let raw = self.raw else { return }
+                    self.lastHeld = 0
+                    self.submit(raw, at: CACurrentMediaTime())
+                }
+            } else if let raw {
+                // Sources like Android only send frames when the screen changes: redo the current one now.
+                clearSince = 0
+                process(raw, takenAt: now)
+            }
+        }
+    }
+
+    private func process(_ source: CVPixelBuffer, takenAt time: CFTimeInterval) {
+        // If the blur fails the frame is dropped: a private frame is never passed on as is.
+        guard let buffer = hidden || time < clearSince ? blurrer.blur(source) : source else { return }
+        latest = buffer
+        recorder?.append(buffer)
+        if gif?.append(buffer) == false { gifLimitReached?() }
+        DispatchQueue.main.async { self.onFrame?(buffer) }
     }
 
     /// Called (on the hub queue) when a GIF hits its frame cap and should be stopped.

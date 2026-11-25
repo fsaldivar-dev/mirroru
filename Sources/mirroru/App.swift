@@ -1,5 +1,7 @@
 import AppKit
 import AVFoundation
+import QuartzCore
+import SwiftUI
 
 struct AppOptions {
     var deviceFilter: String?
@@ -130,6 +132,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fileItem.submenu = fileMenu
         main.addItem(fileItem)
 
+        let privacyItem = NSMenuItem()
+        let privacyMenu = NSMenu(title: "Privacidad")
+        privacyMenu.addItem(item("Ocultar / Mostrar todo", #selector(MirrorWindowController.togglePrivacy), "p"))
+        privacyMenu.addItem(item("Elegir app…", #selector(MirrorWindowController.chooseApp), "k"))
+        privacyMenu.addItem(.separator())
+        let startItem = NSMenuItem(title: "Iniciar en modo privado", action: #selector(toggleStartPrivate(_:)), keyEquivalent: "")
+        startItem.target = self
+        privacyMenu.addItem(startItem)
+        privacyItem.submenu = privacyMenu
+        main.addItem(privacyItem)
+
         let deviceItem = NSMenuItem()
         let deviceMenu = NSMenu(title: "Dispositivo")
         deviceMenu.addItem(item("Inicio", #selector(MirrorWindowController.pressHome), "h", shift: true))
@@ -146,11 +159,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+extension AppDelegate: NSMenuItemValidation {
+    /// New windows start blurred unless the user turned this off.
+    static var startPrivate: Bool {
+        get { UserDefaults.standard.object(forKey: "startPrivate") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "startPrivate") }
+    }
+
+    @objc func toggleStartPrivate(_ sender: NSMenuItem) {
+        Self.startPrivate.toggle()
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(toggleStartPrivate(_:)) { menuItem.state = Self.startPrivate ? .on : .off }
+        return true
+    }
+}
+
 // MARK: - Window
 
 private extension NSToolbarItem.Identifier {
     static let title = NSToolbarItem.Identifier("title")
     static let home = NSToolbarItem.Identifier("home")
+    static let apps = NSToolbarItem.Identifier("apps")
+    static let privacy = NSToolbarItem.Identifier("privacy")
     static let screenshot = NSToolbarItem.Identifier("screenshot")
     static let record = NSToolbarItem.Identifier("record")
     static let gif = NSToolbarItem.Identifier("gif")
@@ -177,9 +209,54 @@ final class MirrorWindowController: NSResponder, NSWindowDelegate, NSToolbarDele
     private var endedByDevice = false
     private var closing = false
 
+    /// Private mode: what of the device's screen is let through.
+    private enum Reveal: Equatable {
+        case hidden
+        case all
+        /// Only this app. On Android the picture follows it; on iOS it stays until the phone locks.
+        case app(DeviceApp)
+    }
+
+    private var reveal = Reveal.hidden
+    /// Whether the chosen app is the one in front right now. Android reports it; on iOS it is
+    /// deduced from the change-of-app announcements and the picture (see `screenChangedHands`).
+    private var appInFront = false
+    /// iOS: looks of the chosen app, taken at calm moments while it was known to be in front.
+    private var knownLooks: [Fingerprint] = []
+    /// iOS: since when the chosen app has been in front (`CACurrentMediaTime`).
+    private var frontSince: CFTimeInterval = 0
+    private var returnCheck: DispatchWorkItem?
+    private var rememberKey: String { "lastApp.\(device.id)" }
+    private let companion: Companion
+    private let picker: AppPickerModel
+    private var popover: NSPopover?
+    private var appsItem: NSToolbarItem?
+    private var privacyItem: NSToolbarItem?
+    private var watchTimer: Timer?
+    private var watchBusy = false
+    /// iOS: stops the observer that reports when the screen changes hands (see `pick`).
+    private var stopObserving: (() -> Void)?
+    private var lastTransition = Date.distantPast
+    private var ignoreTransitionsUntil = Date.distantPast
+    private let watchQueue = DispatchQueue(label: "mirroru.watch")
+
+    /// How long frames wait while one app is followed (see `FrameHub.setHoldback`).
+    static let holdback: CFTimeInterval = 0.8
+
+    private var isHidden: Bool {
+        switch reveal {
+        case .hidden: return true
+        case .all: return false
+        case .app: return !appInFront
+        }
+    }
+
     init(device: Device, source: FrameSource) {
         self.device = device
         self.source = source
+        companion = makeCompanion(for: device)
+        picker = AppPickerModel(companion: companion)
+        reveal = AppDelegate.startPrivate ? .hidden : .all
         let height = min(760, (NSScreen.main?.visibleFrame.height ?? 900) - 140)
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: (height * 9 / 19.5).rounded(), height: height),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -210,6 +287,12 @@ final class MirrorWindowController: NSResponder, NSWindowDelegate, NSToolbarDele
         window.toolbar = toolbar
         window.toolbarStyle = .unifiedCompact
 
+        picker.remembered = UserDefaults.standard.string(forKey: rememberKey)
+        picker.onPick = { [weak self] app in self?.pick(app) }
+        picker.onShowAll = { [weak self] in self?.setReveal(.all) }
+        picker.onHide = { [weak self] in self?.setReveal(.hidden) }
+        applyPrivacy()
+
         view.input = input
         hub.onFrame = { [weak self] buffer in self?.display(buffer) }
         hub.gifLimitReached = { [weak self] in DispatchQueue.main.async { self?.stopGif() } }
@@ -224,6 +307,201 @@ final class MirrorWindowController: NSResponder, NSWindowDelegate, NSToolbarDele
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(view)
         source.start()
+        // An iPhone without Developer Mode cannot list or open apps: show its whole screen by default.
+        if device.platform == .ios, reveal == .hidden {
+            watchQueue.async { [companion] in
+                guard companion.unavailableReason() != nil else { return }
+                DispatchQueue.main.async {
+                    guard self.reveal == .hidden, !self.closing else { return }
+                    self.setReveal(.all)
+                    self.flash("Sin modo desarrollador")
+                }
+            }
+        }
+    }
+
+    // MARK: Private mode
+
+    private func setReveal(_ new: Reveal) {
+        reveal = new
+        appInFront = false
+        knownLooks = []
+        returnCheck?.cancel()
+        applyPrivacy()
+    }
+
+    private func applyPrivacy() {
+        let hidden = isHidden
+        // Following one app: the news that the user left it comes a few tenths late (an announcement on iOS,
+        // the next poll on Android). Frames are held back so that moment never reaches the screen or a capture.
+        var following = false
+        if case .app = reveal { following = true }
+        hub.setHoldback(following ? Self.holdback : 0)
+        // Android reports the app as soon as it starts opening, with the previous screen still fading out.
+        hub.setHidden(hidden, settle: companion.tracksForeground ? 0.5 : 0)
+        var chosen: DeviceApp?
+        if case .app(let app) = reveal { chosen = app }
+        picker.selected = chosen
+        picker.hidden = reveal != .all
+        view.setPrivate(hidden, hint: chosen.map { "Esperando a \($0.name)…" } ?? "Elige una app (⌘K) o muestra todo (⌘P)")
+        if let privacyItem {
+            configure(privacyItem, symbol: reveal == .hidden ? "eye.slash" : "eye",
+                      label: reveal == .hidden ? "Mostrar" : "Ocultar",
+                      tip: reveal == .hidden ? "Mostrar toda la pantalla (⌘P)" : "Ocultar la pantalla (⌘P)")
+        }
+        if let appsItem { appsItem.toolTip = chosen.map { "Mostrando solo \($0.name) · elegir otra app (⌘K)" } ?? "Elegir la app que se muestra (⌘K)" }
+        updateWatch()
+    }
+
+    /// Android: follow the app in front. iOS: go back to private when the phone locks.
+    private func updateWatch() {
+        var interval: TimeInterval?
+        if case .app = reveal, companion.tracksForeground { interval = 0.25 }
+        else if reveal != .hidden, device.platform == .ios { interval = 1.5 }
+        watchTimer?.invalidate()
+        watchTimer = interval.map { Timer.scheduledTimer(withTimeInterval: $0, repeats: true) { [weak self] _ in self?.watch() } }
+    }
+
+    private func watch() {
+        guard !watchBusy else { return }
+        watchBusy = true
+        let state = reveal
+        watchQueue.async { [companion] in
+            var front: String?, locked: Bool?
+            if case .app = state, companion.tracksForeground { front = companion.foreground() } else { locked = companion.isLocked() }
+            DispatchQueue.main.async {
+                self.watchBusy = false
+                guard self.reveal == state, !self.closing else { return }
+                if case .app(let app) = state, companion.tracksForeground {
+                    // Unknown counts as "not in front": when in doubt, stay private.
+                    let inFront = front == app.id
+                    if inFront != self.appInFront {
+                        self.appInFront = inFront
+                        self.applyPrivacy()
+                    }
+                } else if locked == true {
+                    if case .app = state {
+                        // Keep the app chosen: unlocking back into it shows it again.
+                        guard self.appInFront else { return }
+                        // The lock is noticed a couple of seconds late: only looks older than that are the app's.
+                        let now = CACurrentMediaTime()
+                        if let look = self.hub.fingerprint(between: self.frontSince + 1.0, and: now - 3.0) {
+                            self.knownLooks.append(look)
+                        }
+                        self.appInFront = false
+                        self.applyPrivacy()
+                    } else {
+                        self.setReveal(.hidden)
+                    }
+                    self.flash("Bloqueado: modo privado")
+                }
+            }
+        }
+    }
+
+    private func pick(_ app: DeviceApp) {
+        popover?.close()
+        UserDefaults.standard.set(app.id, forKey: rememberKey)
+        picker.remembered = app.id
+        flash("Abriendo \(app.name)…")
+        // Stay private while the app opens, so the home screen is never shown on the way.
+        setReveal(.hidden)
+        picker.selected = app
+        watchQueue.async { [companion] in
+            // iOS cannot say which app is in front, but it does announce every change of app.
+            // Listen before opening the app, so nothing that happens afterwards is missed.
+            if !companion.tracksForeground, self.stopObserving == nil {
+                let stop = companion.observeTransitions { [weak self] in
+                    DispatchQueue.main.async { self?.screenChangedHands() }
+                }
+                DispatchQueue.main.sync { self.stopObserving = stop }
+            }
+            var failure: String?
+            do { try companion.launch(app) } catch { failure = "\(error)" }
+            // Opening the app is itself a change: the announcements of the next second are its own.
+            let settled = Date().addingTimeInterval(1.0)
+            DispatchQueue.main.asyncAfter(deadline: .now() + (companion.tracksForeground ? 0 : 1.2)) {
+                guard !self.closing else { return }
+                if let failure {
+                    self.picker.selected = nil
+                    self.flash(failure)
+                } else if self.lastTransition > settled {
+                    self.flash("Saliste de \(app.name)")
+                } else {
+                    self.ignoreTransitionsUntil = settled
+                    self.setReveal(.app(app))
+                    if !companion.tracksForeground {
+                        // The app was opened from here a moment ago: it is in front.
+                        self.appInFront = true
+                        self.frontSince = CACurrentMediaTime()
+                        self.applyPrivacy()
+                    }
+                }
+            }
+        }
+    }
+
+    /// iOS announces every change of app, but not where the user went.
+    /// Leaving the chosen app goes private at once. While away, each later change is followed by a look at
+    /// the picture: if it shows the app the way it was left, the user is back and it is shown again.
+    private func screenChangedHands() {
+        lastTransition = Date()
+        guard case .app(let app) = reveal, !companion.tracksForeground, lastTransition > ignoreTransitionsUntil else { return }
+        if appInFront {
+            rememberLook()
+            appInFront = false
+            applyPrivacy()
+            flash("Saliste de \(app.name)")
+        }
+        // Announcements come in bursts; look once the animation has settled, and once more for slow resumes.
+        returnCheck?.cancel()
+        let check = DispatchWorkItem { [weak self] in self?.checkReturn(to: app, retry: true) }
+        returnCheck = check
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: check)
+    }
+
+    /// Keeps how the app looked before the user left it. Only a calm moment counts: not the first second
+    /// after arriving (opening animation) nor the last one (the announcement comes into the closing one).
+    /// Going in and out quickly leaves no such moment, and then the looks already known are kept.
+    private func rememberLook() {
+        let now = CACurrentMediaTime()
+        guard let look = hub.fingerprint(between: frontSince + 1.0, and: now - 1.0) else { return }
+        knownLooks.removeAll { $0.matches(look) }
+        knownLooks.append(look)
+        if knownLooks.count > 6 { knownLooks.removeFirst() }
+    }
+
+    private func checkReturn(to app: DeviceApp, retry: Bool) {
+        guard reveal == .app(app), !appInFront, !closing, !knownLooks.isEmpty else { return }
+        if let current = hub.currentFingerprint(), knownLooks.contains(where: { $0.matches(current) }) {
+            appInFront = true
+            frontSince = CACurrentMediaTime()
+            applyPrivacy()
+            flash("De vuelta en \(app.name)")
+        } else if retry {
+            let check = DispatchWorkItem { [weak self] in self?.checkReturn(to: app, retry: false) }
+            returnCheck = check
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: check)
+        }
+    }
+
+    @objc func togglePrivacy() {
+        setReveal(reveal == .hidden ? .all : .hidden)
+    }
+
+    @objc func chooseApp() {
+        if let popover, popover.isShown { return popover.close() }
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(rootView: AppPickerView(model: picker))
+        self.popover = popover
+        picker.query = ""
+        if let anchor = appsItem?.view, anchor.window != nil {
+            popover.show(relativeTo: anchor.bounds, of: anchor, preferredEdge: .maxY)
+        } else {
+            let top = NSRect(x: view.bounds.midX - 1, y: view.bounds.maxY - 2, width: 2, height: 2)
+            popover.show(relativeTo: top, of: view, preferredEdge: .minY)
+        }
     }
 
     private func display(_ buffer: CVPixelBuffer) {
@@ -261,18 +539,18 @@ final class MirrorWindowController: NSResponder, NSWindowDelegate, NSToolbarDele
     // MARK: Toolbar
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.title, .home, .flexibleSpace, .screenshot, .record, .gif]
+        [.title, .home, .flexibleSpace, .apps, .privacy, .screenshot, .record, .gif]
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.title, .flexibleSpace] + (input != nil ? [.home] : []) + [.screenshot, .record, .gif]
+        [.title, .flexibleSpace] + (input != nil ? [.home] : []) + [.apps, .privacy, .screenshot, .record, .gif]
     }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         let item = NSToolbarItem(itemIdentifier: id)
         if id == .title {
-            statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: input != nil ? 104 : 148).isActive = true
+            statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: input != nil ? 56 : 92).isActive = true
             statusLabel.toolTip = "\(device.name) · \(device.platform.rawValue) · \(device.detail)"
             item.view = statusLabel
             item.label = device.name
@@ -284,6 +562,15 @@ final class MirrorWindowController: NSResponder, NSWindowDelegate, NSToolbarDele
         case .home:
             configure(item, symbol: "house", label: "Inicio", tip: "Inicio (⇧⌘H) · clic derecho en la pantalla = Atrás")
             item.action = #selector(pressHome)
+        case .apps:
+            configure(item, symbol: "square.grid.2x2", label: "Apps", tip: "Elegir la app que se muestra (⌘K)")
+            item.action = #selector(chooseApp)
+            appsItem = item
+        case .privacy:
+            configure(item, symbol: "eye.slash", label: "Mostrar", tip: "Mostrar toda la pantalla (⌘P)")
+            item.action = #selector(togglePrivacy)
+            privacyItem = item
+            DispatchQueue.main.async { [weak self] in self?.applyPrivacy() }
         case .screenshot:
             configure(item, symbol: "camera", label: "Captura", tip: "Guardar captura en el Escritorio (⌘S)")
             item.action = #selector(takeScreenshot)
@@ -352,10 +639,12 @@ final class MirrorWindowController: NSResponder, NSWindowDelegate, NSToolbarDele
 
     @objc func takeScreenshot() {
         let url = Output.url(kind: "Captura", device: device.name, ext: "png")
+        // While private only the blurred frame may be saved, never the device's own screenshot.
+        let hidden = isHidden
         DispatchQueue.global(qos: .userInitiated).async { [source, hub] in
             // Prefer the device's own lossless screenshot; fall back to the current video frame.
             var saved = false
-            if let png = source.nativeScreenshot() { saved = (try? png.write(to: url)) != nil }
+            if !hidden, let png = source.nativeScreenshot() { saved = (try? png.write(to: url)) != nil }
             if !saved { saved = hub.screenshot(to: url) }
             DispatchQueue.main.async { self.flash(saved ? "Captura guardada" : "Error al guardar") }
         }
@@ -437,6 +726,9 @@ final class MirrorWindowController: NSResponder, NSWindowDelegate, NSToolbarDele
 
     func windowWillClose(_ notification: Notification) {
         closing = true
+        popover?.close()
+        stopObserving?()
+        watchTimer?.invalidate()
         statusTimer?.invalidate()
         source.onFrame = nil
         source.stop()
@@ -455,6 +747,8 @@ final class MirrorView: NSView {
     private var scrollDelta = CGSize.zero
     private var scrollOrigin = CGPoint.zero
     private var scrollWork: DispatchWorkItem?
+    private let privateBadge = NSStackView()
+    private let privateHint = NSTextField(labelWithString: "")
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -463,6 +757,42 @@ final class MirrorView: NSView {
         screen.contentsGravity = .resizeAspect
         screen.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
         layer?.addSublayer(screen)
+
+        // Shown over the blur. It is part of the window only: captures do not include it.
+        let symbol = NSImageView(image: NSImage(systemSymbolName: "eye.slash.fill", accessibilityDescription: nil) ?? NSImage())
+        symbol.symbolConfiguration = .init(pointSize: 30, weight: .regular)
+        symbol.contentTintColor = .white
+        let title = NSTextField(labelWithString: "Modo privado")
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        title.textColor = .white
+        privateHint.font = .systemFont(ofSize: 12)
+        privateHint.textColor = NSColor.white.withAlphaComponent(0.8)
+        privateHint.alignment = .center
+        privateHint.lineBreakMode = .byWordWrapping
+        privateHint.maximumNumberOfLines = 3
+        privateHint.preferredMaxLayoutWidth = 190
+        [symbol, title, privateHint].forEach(privateBadge.addArrangedSubview)
+        privateBadge.orientation = .vertical
+        privateBadge.spacing = 6
+        privateBadge.isHidden = true
+        privateBadge.shadow = {
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.5)
+            shadow.shadowBlurRadius = 6
+            return shadow
+        }()
+        privateBadge.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(privateBadge)
+        NSLayoutConstraint.activate([
+            privateBadge.centerXAnchor.constraint(equalTo: centerXAnchor),
+            privateBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
+            privateBadge.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -24),
+        ])
+    }
+
+    func setPrivate(_ on: Bool, hint: String) {
+        privateBadge.isHidden = !on
+        privateHint.stringValue = hint
     }
 
     required init?(coder: NSCoder) { fatalError() }

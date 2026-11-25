@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-let version = "0.1.0"
+let version = "0.2.0"
 
 let usage = """
 Mirroru \(version) — espejo de Android e iOS por USB, sin cuentas.
